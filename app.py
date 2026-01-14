@@ -11,21 +11,271 @@ import io
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(layout="wide", page_title="Grafo de Dependências PBI")
 
-# --- CSS PERSONALIZADO ---
+# --- CSS PERSONALIZADO COM ANIMAÇÕES (MELHORIA 26) ---
 st.markdown("""
     <style>
-        [data-testid="stSidebar"] { min-width: 400px; max-width: 400px; }
-        .stMetric { background-color: #f8f9fb; padding: 10px; border-radius: 10px; border: 1px solid #e6e9ef; }
+        /* Sidebar responsiva - Removido CSS fixo para evitar quebra de layout nativo */
+        
+        /* Animações suaves nos cards */
+        .stMetric { 
+            background-color: #f8f9fb; 
+            padding: 10px; 
+            border-radius: 10px; 
+            border: 1px solid #e6e9ef;
+            transition: all 0.3s ease;
+        }
+        .stMetric:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            border-color: #5E9AE9;
+        }
+        
+        /* Animação de fade-in */
+        .element-container {
+            animation: fadeIn 0.5s ease-in;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        /* Efeito hover nos botões */
+        .stDownloadButton > button {
+            transition: all 0.3s ease;
+        }
+        .stDownloadButton > button:hover {
+            transform: scale(1.05);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        }
+        
+        /* Zoom da página para 70% */
+        .main .block-container {
+            zoom: 0.7;
+        }
     </style>
 """, unsafe_allow_html=True)
 
 st.title("📊 Grafo de Dependências — Power BI")
 
-# --- FUNÇÃO DE LIMPEZA DAX ---
+# --- FUNÇÕES AUXILIARES ---
 def limpar_dax(texto):
     if pd.isnull(texto) or texto == "None":
         return ""
     return str(texto).replace("_x000D_", "").strip()
+
+@st.cache_data(ttl=3600)
+def processar_dependencias(df_bytes, tipos_selecionados):
+    """Processa dependências com cache para melhor performance"""
+    df = pd.read_csv(io.BytesIO(df_bytes), sep=None, engine='python', encoding='utf-8-sig')
+    df.columns = df.columns.str.strip()
+    return df
+
+@st.cache_data
+def construir_grafo(arestas_tuple):
+    """Constrói grafo NetworkX com cache"""
+    G = nx.DiGraph()
+    G.add_edges_from(arestas_tuple)
+    return G
+
+def calcular_health_score(medidas_orfas, total_medidas, complexidade_media):
+    """Calcula health score do modelo - Versão Simplificada e Intuitiva"""
+    # Começa com 100
+    score = 100
+    
+    # Deduz por órfãs SE FOR MUITAS (>40%)
+    taxa_orfas = len(medidas_orfas) / max(total_medidas, 1)
+    if taxa_orfas > 0.4:
+        # Penaliza APENAS o excesso acima de 40%
+        score -= (taxa_orfas - 0.4) * 50
+    
+    # Deduz por complexidade extrema
+    if complexidade_media > 7:
+        # Muito complexo = difícil manter
+        score -= (complexidade_media - 7) * 5
+    elif complexidade_media < 2:
+        # Muito simples = subutilizado
+        score -= (2 - complexidade_media) * 5
+    
+    return round(max(0, min(100, score)), 1)
+
+
+def calcular_complexidade_dax(expressao):
+    """Calcula score de complexidade DAX (função antiga - mantida para compatibilidade)"""
+    import re
+    if not expressao or expressao == "":
+        return 0
+    # Conta funções DAX (em maiúsculas seguidas de parênteses)
+    funcoes = len(re.findall(r'\b[A-Z]{2,}\(', expressao))
+    # Conta aninhamentos
+    aninhamentos = expressao.count('(')
+    # Complexidade = funções + aninhamentos / 10
+    return min(10, (funcoes + aninhamentos / 10))
+
+def calcular_complexity_score(expressao, nome_medida="", medidas_dependentes=0):
+    """
+    Calcula Complexity  Score (0-100) com 5 dimensões baseado em SQLBI + Microsoft Learn.
+    
+    Dimensões:
+    - D1: Funções (SUMX, RANKX, FILTER, etc)
+    - D2: CALCULATE e contexto
+    - D3: Estrutura (linhas, VAR, comentários)
+    - D4: Dependências
+    - D5: Anti-patterns
+    
+    Returns:
+        (score, classificacao, detalhes)
+    """
+    import re
+    
+    if not expressao or expressao == "":
+        return 0, "🟢 Simples", []
+    
+    score = 0
+    detalhes = []
+    
+    # === D1: FUNÇÕES (Peso Alto) ===
+    funcoes_peso = {
+        'SUMX': 8, 'AVERAGEX': 8, 'MINX': 8, 'MAXX': 8,
+        'RANKX': 12,
+        'FILTER': 10,
+        'ADDCOLUMNS': 10,
+        'SUMMARIZE': 12, 'SUMMARIZECOLUMNS': 12,
+        'GENERATE': 15,
+        'EARLIER': 20,
+        'PATH': 8, 'CONTAINSROW': 8
+    }
+    
+    for func, penalty in funcoes_peso.items():
+        count = expressao.upper().count(func)
+        if count > 0:
+            score += count * penalty
+            detalhes.append(f"D1: {func} ({count}x) = +{count * penalty}")
+    
+    # === D2: CALCULATE E CONTEXTO ===
+    calculate_count = expressao.upper().count('CALCULATE')
+    if calculate_count > 0:
+        score += calculate_count * 5
+        detalhes.append(f"D2: CALCULATE ({calculate_count}x) = +{calculate_count * 5}")
+    
+    # Múltiplos filtros em CALCULATE
+    calc_pattern = r'CALCULATE\s*\([^,]+,([^)]+)\)'
+    for match in re.findall(calc_pattern, expressao, re.IGNORECASE):
+        filters = match.count(',') + 1
+        if filters > 1:
+            penalty = (filters - 1) * 3
+            score += penalty
+            detalhes.append(f"D2: CALCULATE c/ {filters} filtros = +{penalty}")
+    
+    # ALL, ALLEXCEPT, REMOVEFILTERS
+    context_funcs = {'ALL': 6, 'ALLEXCEPT': 6, 'REMOVEFILTERS': 6, 'KEEPFILTERS': 3}
+    for func, penalty in context_funcs.items():
+        count = expressao.upper().count(func)
+        if count > 0:
+            score += count * penalty
+            detalhes.append(f"D2: {func} ({count}x) = +{count * penalty}")
+    
+    # === D3: ESTRUTURA ===
+    linhas = expressao.count('\n') + 1
+    if linhas > 20:
+        score += 10
+        detalhes.append(f"D3: >20 linhas ({linhas}) = +10")
+    elif linhas > 10:
+        score += 5
+        detalhes.append(f"D3: >10 linhas ({linhas}) = +5")
+    
+    # Bônus: VAR
+    if 'VAR' in expressao.upper():
+        var_count = expressao.upper().count('VAR')
+        bonus = var_count * 5
+        score -= bonus
+        detalhes.append(f"D3: VAR ({var_count}x) = -{bonus} (bônus)")
+    
+    # Bônus: Comentários
+    comentarios = expressao.count('--') + expressao.count('//')
+    if comentarios > 0:
+        bonus = min(comentarios * 2, 10)
+        score -= bonus
+        detalhes.append(f"D3: Comentários ({comentarios}) = -{bonus} (bônus)")
+    
+    # === D4: DEPENDÊNCIAS ===
+    if medidas_dependentes > 0:
+        penalty = medidas_dependentes * 2
+        score += penalty
+        detalhes.append(f"D4: {medidas_dependentes} dependentes = +{penalty}")
+    
+    # === D5: ANTI-PATTERNS ===
+    if re.search(r'FILTER\s*\(\s*ALL\s*\(', expressao, re.IGNORECASE):
+        score += 20
+        detalhes.append("D5: FILTER(ALL(Tabela)) = +20")
+    
+    if 'DATE' in expressao.upper() and not any(x in expressao.upper() for x in ['SAMEPERIODLASTYEAR', 'DATESYTD', 'TOTALYTD', 'DATEADD']):
+        score += 8
+        detalhes.append("D5: Time intelligence manual = +8")
+    
+    # === CLASSIFICAÇÃO ===
+    final_score = min(100, max(0, score))
+    
+    if final_score <= 20:
+        classificacao = "🟢 Simples"
+    elif final_score <= 40:
+        classificacao = "🟡 Moderada"
+    elif final_score <= 60:
+        classificacao = "🟠 Complexa"
+    elif final_score <= 80:
+        classificacao = "🔴 Muito Complexa"
+    else:
+        classificacao = "⚫ Crítica"
+    
+    return final_score, classificacao, detalhes
+
+
+def gerar_relatorio_texto(metricas, medidas_orfas, medidas_impacto, top_complexas=None):
+    """Gera relatório em texto para download (MELHORIA 24)"""
+    
+    # Formatar lista de medidas complexas
+    secao_complexidade = ""
+    if top_complexas:
+        lista_formatada = chr(10).join(f"  • {m['medida']} (Score: {m['score']} - {m['classificacao']})" for m in top_complexas[:10])
+        secao_complexidade = f"""
+🔥 TOP 10 MEDIDAS MAIS COMPLEXAS (CRÍTICAS)
+────────────────────────────────────────────────────────────
+{lista_formatada}
+"""
+
+    relatorio = f"""═══════════════════════════════════════════════════════════
+            RELATÓRIO DE DEPENDÊNCIAS DAX - POWER BI
+═══════════════════════════════════════════════════════════
+
+📊 MÉTRICAS GERAIS
+────────────────────────────────────────────────────────────
+Objetos no Modelo: {metricas.get('objetos', 0)}
+Nós no Grafo: {metricas.get('nos', 0)}
+Relacionamentos: {metricas.get('relacionamentos', 0)}
+Medidas Órfãs: {metricas.get('orfas', 0)}
+Impacto Total: {metricas.get('impacto', 0)}
+{secao_complexidade}
+⚠️ MEDIDAS ÓRFÃS ({len(medidas_orfas)})
+────────────────────────────────────────────────────────────
+O que são Medidas Órfãs?
+Medidas órfãs são medidas que NÃO são referenciadas por nenhuma outra 
+medida no modelo. Isso pode significar:
+  • Medidas finais usadas diretamente em visuais (normal)
+  • Medidas obsoletas que podem ser removidas (limpeza recomendada)
+  • Oportunidades de refatoração
+
+Lista de Medidas Órfãs:
+{chr(10).join(f"  • {m}" for m in sorted(list(medidas_orfas))) if medidas_orfas else "  Nenhuma medida órfã detectada!"}
+
+📊 ANÁLISE DE IMPACTO
+────────────────────────────────────────────────────────────
+{chr(10).join(f"  • {m['medida']}: {m['impacto']} objetos dependentes" for m in medidas_impacto) if medidas_impacto else "  Nenhuma medida selecionada"}
+
+═══════════════════════════════════════════════════════════
+Relatório gerado automaticamente
+═══════════════════════════════════════════════════════════
+"""
+    return relatorio
 
 # --- 1. SESSÃO DE INSTRUÇÕES E DOWNLOAD ---
 with st.expander("📖 Como gerar o arquivo de dependências?", expanded=False):
@@ -35,7 +285,7 @@ with st.expander("📖 Como gerar o arquivo de dependências?", expanded=False):
     2. Vá até a aba **Exibição** e selecione **Visualização de consulta DAX**.
     3. Copie o código abaixo, cole na janela de consulta e clique em **Executar**.
     """)
-    
+
     dax_query = """EVALUATE
 VAR Medidas = INFO.MEASURES()
 VAR Dependencias = INFO.CALCDEPENDENCY()
@@ -44,12 +294,45 @@ SELECTCOLUMNS(
     FILTER(Dependencias, [OBJECT_TYPE] = "MEASURE"),
     "Tipo Origem", [REFERENCED_OBJECT_TYPE],
     "Origem", [REFERENCED_OBJECT],
-    "Expressão Origem", IF([REFERENCED_OBJECT_TYPE] = "MEASURE", MAXX(FILTER(Medidas, [Name] = [REFERENCED_OBJECT]), [Expression]), BLANK()),
+    "Expressão Origem", IF(
+        [REFERENCED_OBJECT_TYPE] = "MEASURE",
+        MAXX(
+            FILTER(Medidas, [Name] = [REFERENCED_OBJECT]),
+            [Expression]
+        ),
+        BLANK()
+    ),
     "Tipo Destino", [OBJECT_TYPE],
     "Destino", [OBJECT],
-    "Expressão Destino", MAXX(FILTER(Medidas, [Name] = [OBJECT]), [Expression])
+    "Expressão Destino", 
+        MAXX(
+            FILTER(Medidas, [Name] = [OBJECT]),
+            [Expression]
+        )
 )"""
+
     st.code(dax_query, language="sql")
+
+    st.markdown("""
+    5. Após executar a consulta, clique em **Copiar** com a opção **Células selecionadas** e, em seguida, cole os dados no arquivo CSV disponibilizado para download..
+    """)
+
+    # Imagem ilustrativa do passo 4
+    st.image(
+        "img/celulas_selecionadas.png",
+        caption="Selecione todas as células do resultado da consulta DAX e copie",
+        width=500
+    )
+
+    st.markdown("""
+    6. Os dados devem estar da seguinte forma """)
+
+    st.image(
+        "img/modelo_dados_inseridos.png",
+        caption="Selecione todas as células do resultado da consulta DAX e copie",
+        width=500
+    )
+
 
     # --- CORREÇÃO: GERAR CSV COM BOM PARA ACENTOS ---
     buffer_csv = io.BytesIO()
@@ -102,7 +385,37 @@ if uploaded_file:
 
         df_filtrado = df[df[col_tipo_origem].isin(tipos_selecionados)]
         todas_destinos = sorted([str(m) for m in df_filtrado[col_destino].unique()])
-        medidas_selecionadas = st.sidebar.multiselect("Selecione as Medidas Destino (Raízes):", options=todas_destinos, default=[])
+        
+        # 🔍 MELHORIA 1: BUSCA DE MEDIDAS
+        st.sidebar.markdown("---")
+        busca_medida = st.sidebar.text_input("🔍 Buscar Medida:", "", placeholder="Digite para filtrar...")
+        
+        # Filtrar medidas baseado na busca
+        if busca_medida:
+            medidas_filtradas = [m for m in todas_destinos if busca_medida.lower() in m.lower()]
+            st.sidebar.caption(f"📊 {len(medidas_filtradas)} medidas encontradas")
+        else:
+            medidas_filtradas = todas_destinos
+        
+        medidas_selecionadas = st.sidebar.multiselect(
+            "Selecione as Medidas Destino (Raízes):", 
+            options=medidas_filtradas, 
+            default=[]
+        )
+        
+        # 🔄 DIREÇÃO DO GRAFO
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🔄 Direção do Grafo")
+        direcao_grafo = st.sidebar.radio(
+            "Escolha o que visualizar:",
+            options=[
+                "⬇️ Dependências (do que a medida depende)",
+                "⬆️ Dependentes (quem depende da medida)"
+            ],
+            index=0,
+            help="⬇️ Dependências: mostra as colunas, tabelas e medidas que a raiz usa\n"
+                 "⬆️ Dependentes: mostra quais outras medidas dependem da raiz"
+        )
 
         # Mapeamento de Info Limpo
         info_map = {}
@@ -115,38 +428,160 @@ if uploaded_file:
 
         if medidas_selecionadas:
             arestas, visitados, fila = [], set(), list(medidas_selecionadas)
+            
+            # Determinar modo de navegação baseado na escolha do usuário
+            modo_dependencias = "⬇️" in direcao_grafo or "🔄" in direcao_grafo
+            modo_dependentes = "⬆️" in direcao_grafo or "🔄" in direcao_grafo
+            
             while fila:
                 atual = fila.pop(0)
                 if atual not in visitados:
                     visitados.add(atual)
-                    filhos = df_filtrado[df_filtrado[col_destino] == atual][col_origem].tolist()
-                    for filho in filhos:
-                        arestas.append((atual, filho))
-                        if filho not in visitados: fila.append(filho)
+                    
+                    # MODO 1: Dependências (do que depende) - direção original
+                    if modo_dependencias:
+                        filhos = df_filtrado[df_filtrado[col_destino] == atual][col_origem].tolist()
+                        for filho in filhos:
+                            arestas.append((atual, filho))
+                            if filho not in visitados: fila.append(filho)
+                    
+                    # MODO 2: Dependentes (quem depende) - direção reversa
+                    if modo_dependentes:
+                        pais = df_filtrado[df_filtrado[col_origem] == atual][col_destino].tolist()
+                        for pai in pais:
+                            arestas.append((pai, atual))
+                            if pai not in visitados: fila.append(pai)
             
             G = nx.DiGraph()
             G.add_edges_from(arestas)
 
-            # --- 4. MÉTRICAS ---
-            c1, c2, c3, c4 = st.columns(4)
+            # ⚠️ MELHORIA 2: DETECÇÃO DE MEDIDAS ÓRFÃS
+            origens_unicas = set(df_filtrado[col_origem].unique())
+            destinos_unicos = set(df_filtrado[col_destino].unique())
+            medidas_orfas = destinos_unicos - origens_unicas
+            
+            # 📊 MELHORIA 5: ANÁLISE DE IMPACTO
+            total_impacto = 0
+            if medidas_selecionadas:
+                for medida in medidas_selecionadas:
+                    if medida in G:
+                        descendentes = nx.descendants(G, medida)
+                        total_impacto += len(descendentes)
+            
+            
+            # --- 4. MÉTRICAS APRIMORADAS ---
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Objetos no Modelo", df[col_origem].nunique())
             c2.metric("Nós no Grafo", len(G.nodes()))
             c3.metric("Relacionamentos", len(arestas))
-            c4.metric("Tipos Ativos", len(tipos_selecionados))
+            c4.metric(
+                "Medidas Órfãs", 
+                len(medidas_orfas),
+                help="🔍 MEDIDAS ÓRFÃS são medidas que não são referenciadas por nenhuma outra medida no modelo. Elas podem indicar: (1) medidas finais usadas diretamente em visuais, (2) medidas obsoletas que podem ser removidas, ou (3) oportunidades de refatoração. Um número alto sugere revisão de limpeza."
+            )
+            
+            # === CÁLCULO DE COMPLEXIDADE DAX ===
+            scores_complexidade = []
+            medidas_complexas = []  # Para relatório
+            
+            for node in G.nodes():
+                exp = info_map.get(node, {}).get("exp", "")
+                tipo = info_map.get(node, {}).get("tipo", "")
+                if exp and tipo == "MEASURE":
+                    # Contar dependentes (quantas medidas dependem desta)
+                    dependentes = len(list(G.predecessors(node)))
+                    score, classificacao, _ = calcular_complexity_score(exp, node, dependentes)
+                    scores_complexidade.append(score)
+                    medidas_complexas.append({'medida': node, 'score': score, 'classificacao': classificacao})
+            
+            score_medio = round(sum(scores_complexidade) / len(scores_complexidade), 1) if scores_complexidade else 0
+            
+            # Classificação do modelo
+            if score_medio <= 20:
+                class_modelo = "🟢 Simples"
+            elif score_medio <= 40:
+                class_modelo = "🟡 Moderada"
+            elif score_medio <= 60:
+                class_modelo = "🟠 Complexa"
+            elif score_medio <= 80:
+                class_modelo = "🔴 Muito Complexa"
+            else:
+                class_modelo = "⚫ Crítica"
+            
+            c5.metric(
+                "📊 Complexidade DAX",
+                f"{score_medio}/100",
+                delta=class_modelo,
+                help="Score de 0 a 100 baseado em 5 dimensões (Funções, Contexto, Estrutura, Dependências, Anti-patterns).\n\n👇 Abra a seção 'ℹ️ Entenda o Cálculo' abaixo para ver a tabela de regras completa."
+            )
+            
+            # ℹ️ TABELA DE REGRAS DE COMPLEXIDADE (Expansível)
+            with st.expander("ℹ️ Entenda o Cálculo da Complexidade (Tabela de Regras)", expanded=False):
+                st.markdown("""
+                ### 📊 Como o Score é calculado?
+                O score começa em **0** e acumula pontos de penalidade. Quanto menor, melhor.
+                O KPI final é normalizado para **0-100**.
+                
+                #### 1️⃣ D1: Funções DAX (Peso Alto)
+                | Função | Penalidade | Motivo |
+                |---|---|---|
+                | `SUMX`, `AVERAGEX`, `MINX`, `MAXX` | **+8** pts | Iterador (força Formula Engine) |
+                | `RANKX` | **+12** pts | Custo computacional alto |
+                | `FILTER` | **+10** pts | Iteração muitas vezes desnecessária |
+                | `ADDCOLUMNS` | **+10** pts | Materialização temporária |
+                | `SUMMARIZE`, `SUMMARIZECOLUMNS` | **+12** pts | Complexo para otimizar |
+                | `GENERATE` | **+15** pts | Cross join custoso |
+                | `EARLIER` | **+20** pts | Difícil leitura/manutenção |
+                
+                #### 2️⃣ D2: Contexto e CALCULATE
+                | Regra | Penalidade |
+                |---|---|
+                | Cada `CALCULATE` | **+5** pts |
+                | `CALCULATE` com múltiplos filtros | **+3** pts por filtro extra |
+                | `ALL`, `ALLEXCEPT`, `REMOVEFILTERS` | **+6** pts |
+                | `KEEPFILTERS` | **+3** pts |
+                
+                #### 3️⃣ D3: Estrutura do Código
+                | Métrica | Pontos |
+                |---|---|
+                | Mais de 10 linhas | **+5** pts |
+                | Mais de 20 linhas | **+10** pts |
+                | Uso de Variáveis (`VAR`) | **-5** pts (BÔNUS 🟢) |
+                | Comentários (`--` ou `//`) | **-2** pts (BÔNUS 🟢) |
+                
+                #### 4️⃣ D4: Dependências
+                | Item | Penalidade |
+                |---|---|
+                | Por medida dependente | **+2** pts |
+                
+                #### 5️⃣ D5: Anti-patterns (Erros Comuns)
+                | Anti-pattern | Penalidade |
+                |---|---|
+                | `FILTER(ALL(Tabela))` | **+20** pts (Muito ineficiente) |
+                | Time Intelligence Manual | **+8** pts (Use funções nativas) |
+                """)
+        
 
-            # --- 5. LEGENDA ---
+            # --- 6. GERAÇÃO DO GRAFO COM ÍCONES (MELHORIA 27) ---
+            # Ícones por tipo de objeto
             cores = {"MEASURE": "#88B995", "COLUMN": "#5E9AE9", "TABLE": "#F4A460", "UNKNOWN": "#CCCCCC"}
-            st.write("###")
-            cols_leg = st.columns(4)
-            for i, (k, v) in enumerate(list(cores.items())[:4]):
-                cols_leg[i].markdown(f'<div style="display:flex;align-items:center;gap:10px;background:#f8f9fb;padding:5px 15px;border-radius:8px;border:1px solid #ddd;"><div style="width:12px;height:12px;background:{v};border-radius:2px;"></div><span style="font-size:14px;font-weight:bold;">{k}</span></div>', unsafe_allow_html=True)
-            st.write("###")
-
-            # --- 6. GERAÇÃO DO GRAFO ---
+            icones = {"MEASURE": "📊", "COLUMN": "📋", "TABLE": "📁", "UNKNOWN": "❓"}
+            
             net = Network(height="600px", width="100%", directed=True, bgcolor="#ffffff")
             for node in G.nodes():
                 tipo = info_map.get(node, {}).get("tipo", "UNKNOWN")
-                net.add_node(node, label=node, title="Clique para ver o DAX", color=cores.get(tipo, cores["UNKNOWN"]), shape="box", margin=10, font={"face": "Segoe UI"})
+                icone = icones.get(tipo, icones["UNKNOWN"])
+                # Label com ícone
+                label_com_icone = f"{icone} {node}"
+                net.add_node(
+                    node, 
+                    label=label_com_icone, 
+                    title=f"Clique para ver o DAX\nTipo: {tipo}", 
+                    color=cores.get(tipo, cores["UNKNOWN"]), 
+                    shape="box", 
+                    margin=10, 
+                    font={"face": "Segoe UI", "size": 14}
+                )
             for u, v in G.edges():
                 net.add_edge(u, v, color="#CCCCCC", width=1)
 
@@ -189,21 +624,137 @@ if uploaded_file:
             </script>
             """
             full_html = html_content.replace("</body>", f"{custom_js}</body>")
-            html(full_html, height=650)
+            
+            # 📸 MELHORIA 3 & 24: EXPORTAÇÃO HTML E RELATÓRIO
+            # Gerar relatório de texto
+            metricas_relatorio = {
+                'objetos': df[col_origem].nunique(),
+                'nos': len(G.nodes()),
+                'relacionamentos': len(arestas),
+                'orfas': len(medidas_orfas),
+                'impacto': total_impacto
+            }
+            
+            # Gerar lista de impacto
+            medidas_impacto_lista = []
+            for medida in medidas_selecionadas:
+                if medida in G:
+                    desc = nx.descendants(G, medida)
+                    medidas_impacto_lista.append({'medida': medida, 'impacto': len(desc)})
+            
+            # Preparar top complexas se disponível
+            top_complexas_export = sorted(todas_medidas_complexas, key=lambda x: x['score'], reverse=True) if 'todas_medidas_complexas' in locals() and todas_medidas_complexas else []
 
+            relatorio_txt = gerar_relatorio_texto(metricas_relatorio, medidas_orfas, medidas_impacto_lista, top_complexas_export)
+            
+            # Botões de exportação acima do grafo
+            col_export1, col_export2, col_spacer = st.columns([1, 1, 6])
+            
+            with col_export1:
+                st.download_button(
+                    label="📸 Exportar HTML",
+                    data=full_html,
+                    file_name="grafo_dependencias.html",
+                    mime="text/html",
+                    help="Baixe o grafo como arquivo HTML interativo",
+                    use_container_width=True
+                )
+            
+            with col_export2:
+                st.download_button(
+                    label="📄 Exportar Relatório",
+                    data=relatorio_txt,
+                    file_name="relatorio_dependencias.txt",
+                    mime="text/plain",
+                    help="Baixe relatório completo em formato texto",
+                    use_container_width=True
+                )
+            
+            # Legenda acima do grafo
+            legenda_html = '<div style="display:flex;align-items:center;gap:20px;padding:12px 0;font-size:14px;"><span style="font-weight:600;margin-right:10px;">Legenda:</span>'
+            for k, v in cores.items():
+                icone = icones.get(k, "")
+                legenda_html += f'<div style="display:inline-flex;align-items:center;gap:6px;"><div style="width:12px;height:12px;background:{v};border-radius:2px;"></div><span>{icone} {k}</span></div>'
+            legenda_html += '</div>'
+            st.markdown(legenda_html, unsafe_allow_html=True)
+            
+            # Grafo em largura total
+            html(full_html, height=650)
+            
+            # 📊 RANKING DE COMPLEXIDADE GLOBAL (MODELO TODO)
             st.markdown("---")
-            st.subheader("📑 Detalhes dos Objetos (DAX)")
-            nos_ordenados = sorted(list(G.nodes()))
-            col_a, col_b = st.columns(2)
-            for i, n in enumerate(nos_ordenados):
-                info = info_map.get(n, {})
-                exp, tipo = info.get("exp", ""), info.get("tipo", "UNKNOWN")
-                target = col_a if i % 2 == 0 else col_b
-                with target:
-                    if exp:
-                        with st.expander(f"📌 {tipo}: {n}"): st.code(exp, language="sql")
-                    else:
-                        with st.expander(f"⚪ {tipo}: {n}"): st.write("Objeto nativo ou sem expressão DAX.")
+            st.subheader("🏆 Ranking de Complexidade (Modelo Todo)")
+            
+            # Calcular dependentes globais (quantas vezes cada medida é usada)
+            # Se A depende de B, então B aparece como destino de A.
+            # Dependentes de X = Quantas vezes X aparece como destino.
+            global_dependentes_count = df[col_destino].value_counts().to_dict()
+            
+            todas_medidas_complexas = []
+            
+            # Iterar sobre TODAS as medidas do modelo (info_map)
+            for nome_medida, info in info_map.items():
+                if info.get("tipo") == "MEASURE":
+                    exp = info.get("exp", "")
+                    # Pegar número de dependentes globalmente
+                    n_dependentes = global_dependentes_count.get(nome_medida, 0)
+                    
+                    score, classificacao, _ = calcular_complexity_score(exp, nome_medida, n_dependentes)
+                    todas_medidas_complexas.append({
+                        'medida': nome_medida, 
+                        'score': score, 
+                        'classificacao': classificacao
+                    })
+            
+            if todas_medidas_complexas:
+                # Ordenar por score decrescente
+                top_complexas_global = sorted(todas_medidas_complexas, key=lambda x: x['score'], reverse=True)
+                
+                # Criar DataFrame
+                df_rank_global = pd.DataFrame(top_complexas_global)
+                df_rank_global = df_rank_global[['medida', 'score', 'classificacao']]
+                df_rank_global.columns = ['Medida', 'Score', 'Classificação']
+                
+                # Mostrar tabela com paginação nativa (dataframe handling)
+                st.dataframe(
+                    df_rank_global,
+                    column_config={
+                        "Medida": st.column_config.TextColumn("Medida", width="large"),
+                        "Score": st.column_config.ProgressColumn(
+                            "Score de Complexidade",
+                            help="Score de 0 a 100",
+                            format="%d",
+                            min_value=0,
+                            max_value=100,
+                        ),
+                        "Classificação": st.column_config.TextColumn("Classificação", width="medium"),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    height=400  # Altura fixa para permitir scroll/paginação
+                )
+            
+            # 📊 ANÁLISE DE IMPACTO DETALHADA
+            if medidas_selecionadas:
+                st.markdown("---")
+                st.subheader("📊 Análise de Impacto por Medida")
+                
+                cols_impacto = st.columns(min(3, len(medidas_selecionadas)))
+                for idx, medida in enumerate(medidas_selecionadas):
+                    with cols_impacto[idx % 3]:
+                        if medida in G:
+                            descendentes = nx.descendants(G, medida)
+                            with st.container():
+                                st.metric(
+                                    label=f"🎯 {medida}",
+                                    value=f"{len(descendentes)} objetos",
+                                    help=f"Alterar esta medida impactará {len(descendentes)} objetos dependentes"
+                                )
+                                if len(descendentes) > 0:
+                                    with st.expander("Ver dependências"):
+                                        st.write(sorted(list(descendentes)))
+
+
         else:
             st.info("Selecione pelo menos uma Medida Raiz na barra lateral.")
     else:
